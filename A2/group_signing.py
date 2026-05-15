@@ -22,8 +22,7 @@ from ipv8_service import IPv8
 
 LAB2_COMMUNITY_ID = bytes.fromhex("4c61623247726f75705369676e696e6732303236")
 SERVER_KEY = bytes.fromhex(
-    "4c69624e61434c504b3a82e33614a342774e084af80835838d6dbdb64a537d3ddb6c1d82011"
-    "a7f101553cda40cf5fa0e0fc23abd0a9c4f81322282c5b34566f6b8401f5f683031e60c96"
+    "4c69624e61434c504b3a82e33614a342774e084af80835838d6dbdb64a537d3ddb6c1d82011a7f101553cda40cf5fa0e0fc23abd0a9c4f81322282c5b34566f6b8401f5f683031e60c96"
 )
 
 TEAM_SIZE = 3
@@ -33,14 +32,6 @@ EMPTY_TRIGGER = b""
 
 def out(line: str) -> None:
     print(line, flush=True)
-    
-def read_private_public_key(path: Path) -> bytes:
-    if not path.exists():
-        raise FileNotFoundError(
-            f"{path} does not exist; use the same private key file that passed Lab 1"
-        )
-    with path.open("rb") as handle:
-        return default_eccrypto.key_from_private_bin(handle.read()).pub().key_to_bin()
 
 
 class GroupRegistration(VariablePayloadWID):
@@ -80,7 +71,7 @@ class Verdict(VariablePayloadWID):
 
 
 class PeerRound(VariablePayloadWID):
-    """Shared teammate protocol: empty nonce starts submitter mode; 32 bytes asks for a signature."""
+    """Shared protocol: empty nonce starts submitter mode; 32 bytes asks for a signature."""
 
     msg_id = 10
     format_list = ["varlenHutf8", "q", "varlenH"]
@@ -122,8 +113,9 @@ class TeammateOverlay(Community):
         self.rounds_started: set[int] = set()
         self.rounds_touched: set[int] = set()
         self.finished = asyncio.Event()
+        self.debug_peers = False
 
-    def install_group(self, keys: list[bytes], group_id: str) -> None:
+    def install_group(self, keys: list[bytes], group_id: str, debug_peers: bool = False) -> None:
         if len(keys) != TEAM_SIZE:
             raise ValueError("exactly 3 public keys are required")
 
@@ -134,6 +126,7 @@ class TeammateOverlay(Community):
         self.keys = (keys[0], keys[1], keys[2])
         self.slot = keys.index(me)
         self.group_id = group_id
+        self.debug_peers = debug_peers
 
     def is_server(self, peer: Peer) -> bool:
         return peer.public_key.key_to_bin() == SERVER_KEY
@@ -166,14 +159,46 @@ class TeammateOverlay(Community):
         assert self.keys is not None
         expected = {key for key in self.keys if key != self.my_peer.public_key.key_to_bin()}
         started = time.monotonic()
+        last_log = 0.0
 
         while time.monotonic() - started < seconds:
             visible = {peer.public_key.key_to_bin() for peer in self.get_peers()} & expected
             if visible == expected:
                 return
+            now = time.monotonic()
+            if self.debug_peers and now - last_log >= 5.0:
+                last_log = now
+                out(f"[debug] visible teammates={len(visible)}/{len(expected)}; known peers={len(self.get_peers())}")
+                self.print_peer_debug(visible, expected)
             await asyncio.sleep(0.2)
 
         raise TimeoutError(f"only found {len(visible)}/{len(expected)} teammate peers")
+
+    def print_peer_debug(self, visible: set[bytes], expected: set[bytes]) -> None:
+        assert self.keys is not None
+        me = self.my_peer.public_key.key_to_bin()
+
+        for index, key in enumerate(self.keys, start=1):
+            if key == me:
+                marker = "me"
+            else:
+                marker = "found" if key in visible else "missing"
+            out(f"[debug] member{index} {marker}: {key.hex()}")
+
+        peers = self.get_peers()
+        if not peers:
+            out("[debug] no IPv8 peers are visible yet")
+            return
+
+        for peer in peers[:10]:
+            key = peer.public_key.key_to_bin()
+            if key == SERVER_KEY:
+                label = "server"
+            elif key in expected:
+                label = "teammate"
+            else:
+                label = "other"
+            out(f"[debug] visible {label} at {peer.address}: {key.hex()}")
 
     async def register_or_reuse(self, timeout: float, interval: float) -> None:
         assert self.keys is not None
@@ -231,6 +256,7 @@ class TeammateOverlay(Community):
         await self.send_bundle_until_verdict(round_number)
 
         verdict = self.verdicts.get(round_number)
+        print(verdict)
         if verdict is None or not verdict.success:
             return
         if verdict.rounds_completed >= FINAL_ROUND:
@@ -387,7 +413,8 @@ class TeammateOverlay(Community):
             if self.keys[self.slot] == submitter_key:
                 self.register_anonymous_task(
                     f"round-{payload.round_number}-submitter",
-                    self.submitter_round(payload.round_number),
+                    self.submitter_round,
+                    payload.round_number,
                 )
             return
 
@@ -397,7 +424,11 @@ class TeammateOverlay(Community):
         out(f"[round {payload.round_number}] signing for submitter")
         self.register_anonymous_task(
             f"round-{payload.round_number}-signer",
-            self.send_signature_back(peer, payload.group_id, payload.round_number, payload.nonce),
+            self.send_signature_back,
+            peer,
+            payload.group_id,
+            payload.round_number,
+            payload.nonce,
         )
 
     @lazy_wrapper(PeerSignature)
@@ -483,7 +514,7 @@ async def run(args: argparse.Namespace) -> int:
     ipv8 = IPv8(builder.finalize(), extra_communities={"TeammateOverlay": TeammateOverlay})
     await ipv8.start()
     overlay: TeammateOverlay = ipv8.get_overlay(TeammateOverlay)
-    overlay.install_group(keys, args.group_id)
+    overlay.install_group(keys, args.group_id, args.debug_peers)
 
     out(f"[system] port={args.port}")
     out(f"[system] public_key={public_key.hex()}")
@@ -512,7 +543,7 @@ async def run(args: argparse.Namespace) -> int:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Alternative Lab 2 teammate client")
+    parser = argparse.ArgumentParser(description="Lab 2 client")
     parser.add_argument("--role", choices=["coordinator", "member1", "member2", "member3"], default="member2")
     parser.add_argument("--key", type=Path, required=True)
     parser.add_argument("--port", type=int, default=8091)
@@ -525,9 +556,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--peer3", default="", help="member1/coordinator shorthand for member3")
 
     parser.add_argument("--start", action="store_true", help="register and start round 1 from this node")
-    parser.add_argument("--discovery-timeout", type=float, default=120.0)
+    parser.add_argument("--discovery-timeout", type=float, default=300.0)
     parser.add_argument("--retry-interval", type=float, default=1.5)
-    parser.add_argument("--runtime", type=float, default=180.0)
+    parser.add_argument("--runtime", type=float, default=300.0)
+    parser.add_argument("--debug-peers", action="store_true", help="print visible peer public keys while waiting")
     return parser.parse_args()
 
 
