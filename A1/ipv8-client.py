@@ -1,14 +1,3 @@
-"""
-Usage:
-    python lab1_pow_client.py --email <tudelft email> --github <repo url>
-
-Options:
-    --email      Your TU Delft email address
-    --github     Your public GitHub repo URL
-    --key        Path to your .pem key file (default: my_key.pem, created if missing)
-    --nonce      Skip mining and use this nonce (for testing)
-    --port       UDP port to bind (default: 8090, change if already in use)
-"""
 import argparse
 import asyncio
 import hashlib
